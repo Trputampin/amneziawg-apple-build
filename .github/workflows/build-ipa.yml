@@ -1,0 +1,115 @@
+name: Build AmneziaWG IPA (unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Marketing version override (e.g. 3.1.4). Empty = use Version.xcconfig"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: xcodebuild (iphoneos, arm64)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: Sources/WireGuardKitGo/go.mod
+          cache-dependency-path: Sources/WireGuardKitGo/go.sum
+          cache: true
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          go version
+
+      # The upstream project references libwg-go.a with a path relative to the
+      # original author's home dir (~/Development/git/...). Make it portable.
+      - name: Make libwg-go.a reference portable
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("WireGuard.xcodeproj/project.pbxproj")
+          s = p.read_text()
+          s2 = re.sub(r'path = "[^"]*libwg-go\.a";', 'path = "libwg-go.a";', s)
+          if s2 != s:
+              p.write_text(s2)
+              print("patched libwg-go.a reference")
+          else:
+              print("libwg-go.a reference already portable")
+          PY
+
+      - name: Build (no code signing)
+        run: |
+          set -o pipefail
+          VERSION_ARGS=""
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION_ARGS="MARKETING_VERSION=${{ inputs.version }}"
+          fi
+          xcodebuild \
+            -project WireGuard.xcodeproj \
+            -target WireGuardiOS \
+            -configuration Release \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            SYMROOT="$PWD/build" \
+            OBJROOT="$PWD/build/obj" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            $VERSION_ARGS \
+            build 2>&1 | tee build.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP=$(find build/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)
+          echo "App bundle: $APP"
+          test -n "$APP"
+          if [ ! -d "$APP/PlugIns/WireGuardNetworkExtension.appex" ]; then
+            echo "::warning::network extension was not embedded into the app bundle"
+          fi
+          rm -rf Payload AmneziaWG-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          /usr/bin/zip -qry AmneziaWG-unsigned.ipa Payload
+          ls -lh AmneziaWG-unsigned.ipa
+          shasum -a 256 AmneziaWG-unsigned.ipa | tee sha256.txt
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist" > version.txt || true
+          cat version.txt || true
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AmneziaWG-unsigned-ipa
+          path: |
+            AmneziaWG-unsigned.ipa
+            sha256.txt
+            version.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload logs (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
